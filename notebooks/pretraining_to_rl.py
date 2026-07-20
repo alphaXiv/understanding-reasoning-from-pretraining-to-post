@@ -179,9 +179,9 @@ def _(mo):
     The longer-pretrained arm had lower validation loss in all eight pairs, higher mean
     pass@1 at every matched update, and a steeper mean RL slope. That reproduces the two
     selected directional claims at reduced scale. With only two exposure levels, it does
-        not re-estimate the paper's approximately linear multi-checkpoint scaling law or its
-        reported +0.84 slope–token correlation. The three-level robustness round above adds
-        directional evidence while also showing substantial seed noise.
+    not re-estimate the paper's approximately linear multi-checkpoint scaling law or its
+    reported +0.84 slope–token correlation. The three-level robustness round above adds
+    directional evidence while also showing substantial seed noise.
     """)
     return
 
