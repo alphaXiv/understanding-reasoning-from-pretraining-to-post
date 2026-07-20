@@ -1,7 +1,7 @@
 {
-  "arm": "short",
+  "arm": "long",
   "seed": 20260720,
-  "pretrain_shards": 8,
+  "pretrain_shards": 32,
   "sequence_length": 256,
   "pretrain_batch_per_gpu": 16,
   "pretrain_lr": 0.001,
