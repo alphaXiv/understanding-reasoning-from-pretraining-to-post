@@ -205,7 +205,8 @@ def normalized_fen(board: chess.Board) -> str:
 
 def load_puzzles(path: Path, sft_positions: set[str], train_n: int, eval_n: int) -> tuple[list[Puzzle], list[Puzzle]]:
     frame = pd.read_parquet(path)
-    records: list[Puzzle] = []
+    train_set: list[Puzzle] = []
+    eval_set: list[Puzzle] = []
     for row in frame.itertuples(index=False):
         info, reward = row.extra_info, row.reward_model
         puzzle_id = str(info.get("PuzzleId", ""))
@@ -214,6 +215,10 @@ def load_puzzles(path: Path, sft_positions: set[str], train_n: int, eval_n: int)
         try:
             truth = ast.literal_eval(str(reward.get("ground_truth")))
             board = chess.Board(str(info["FEN"]))
+            environment_move = chess.Move.from_uci(str(info["first_move_uci"]))
+            if environment_move not in board.legal_moves:
+                continue
+            board.push(environment_move)
             target = str(truth[0])
             move = chess.Move.from_uci(target)
         except Exception:
@@ -227,11 +232,13 @@ def load_puzzles(path: Path, sft_positions: set[str], train_n: int, eval_n: int)
         prompt_toks, _ = pgn_tokens(prompt_text)
         if len(prompt_toks) < 6:
             continue
-        records.append(Puzzle(puzzle_id, [BOS] + ids(prompt_toks), board, target, rating))
-    records.sort(key=lambda p: (stable_bucket(p.puzzle_id), p.puzzle_id))
-    eval_set = [p for p in records if stable_bucket(p.puzzle_id) < 2000][:eval_n]
-    eval_ids = {p.puzzle_id for p in eval_set}
-    train_set = [p for p in records if p.puzzle_id not in eval_ids][:train_n]
+        puzzle = Puzzle(puzzle_id, [BOS] + ids(prompt_toks), board, target, rating)
+        if stable_bucket(puzzle_id) < 2000 and len(eval_set) < eval_n:
+            eval_set.append(puzzle)
+        elif stable_bucket(puzzle_id) >= 2000 and len(train_set) < train_n:
+            train_set.append(puzzle)
+        if len(train_set) == train_n and len(eval_set) == eval_n:
+            break
     if len(train_set) < train_n or len(eval_set) < eval_n:
         raise RuntimeError(f"insufficient puzzles: train={len(train_set)} eval={len(eval_set)}")
     return train_set, eval_set
