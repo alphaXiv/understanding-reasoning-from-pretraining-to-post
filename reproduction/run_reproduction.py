@@ -145,7 +145,8 @@ def apply_rope(x: torch.Tensor) -> torch.Tensor:
     positions = torch.arange(t, device=x.device, dtype=torch.float32)
     inv = 1.0 / (10_000 ** (torch.arange(0, d, 2, device=x.device, dtype=torch.float32) / d))
     angles = torch.outer(positions, inv)
-    cos, sin = angles.cos()[None, None], angles.sin()[None, None]
+    cos = angles.cos()[None, None].to(dtype=x.dtype)
+    sin = angles.sin()[None, None].to(dtype=x.dtype)
     even, odd = x[..., 0::2], x[..., 1::2]
     return torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1).flatten(-2)
 
