@@ -29,10 +29,8 @@ import chess.pgn
 import numpy as np
 import pandas as pd
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 FILES, RANKS = "abcdefgh", "12345678"
@@ -295,20 +293,18 @@ def cosine_lr(step: int, total: int, peak: float, minimum: float, warmup_ratio: 
     return minimum + 0.5 * (peak - minimum) * (1 + math.cos(math.pi * progress))
 
 
-def validate_lm(model: nn.Module, data: np.ndarray, device: torch.device, rank: int, world: int, seq: int) -> float:
-    module = model.module if isinstance(model, DDP) else model
-    module.eval()
+def validate_lm(model: nn.Module, data: np.ndarray, device: torch.device, seq: int) -> float:
+    model.eval()
     losses = torch.zeros(2, device=device)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        starts = list(range(rank * seq, min(len(data) - seq - 1, 256 * seq * world), seq * world))
+        starts = list(range(0, min(len(data) - seq - 1, 256 * seq), seq))
         for offset in range(0, len(starts), 16):
             chunk = starts[offset : offset + 16]
             x = torch.tensor(np.stack([data[s : s + seq] for s in chunk]), dtype=torch.long, device=device)
             y = torch.tensor(np.stack([data[s + 1 : s + seq + 1] for s in chunk]), dtype=torch.long, device=device)
-            loss = F.cross_entropy(module(x).flatten(0, 1), y.flatten())
+            loss = F.cross_entropy(model(x).flatten(0, 1), y.flatten())
             losses += torch.tensor([float(loss) * len(chunk), len(chunk)], device=device)
-    dist.all_reduce(losses)
-    module.train()
+    model.train()
     return float((losses[0] / losses[1]).item())
 
 
@@ -365,21 +361,18 @@ def reasoning_contexts(module: nn.Module, puzzles: list[Puzzle], device: torch.d
     return contexts, ucis, actions
 
 
-def evaluate_pass1(model: nn.Module, puzzles: list[Puzzle], device: torch.device, rank: int, world: int) -> tuple[float, int]:
-    module = model.module if isinstance(model, DDP) else model
-    local = puzzles[rank::world]
+def evaluate_pass1(model: nn.Module, puzzles: list[Puzzle], device: torch.device) -> tuple[float, int]:
     counts = torch.zeros(2, device=device)
-    module.eval()
+    model.eval()
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        for start in range(0, len(local), 16):
-            batch = local[start : start + 16]
-            contexts, ucis, actions = reasoning_contexts(module, batch, device)
-            scores = score_action_sequences(module, contexts, actions, device)
+        for start in range(0, len(puzzles), 16):
+            batch = puzzles[start : start + 16]
+            contexts, ucis, actions = reasoning_contexts(model, batch, device)
+            scores = score_action_sequences(model, contexts, actions, device)
             for puzzle, moves, move_scores in zip(batch, ucis, scores):
                 counts[0] += float(moves[int(move_scores.argmax())] == puzzle.target)
                 counts[1] += 1
-    dist.all_reduce(counts)
-    module.train()
+    model.train()
     return float((counts[0] / counts[1]).item()), int(counts[1].item())
 
 
@@ -388,15 +381,14 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     args = parser.parse_args()
     cfg = json.loads(Path(args.config).read_text())
-    # Bind each process before NCCL creates communicators.  This is required on
-    # the 8-GPU Kubernetes pods and removes ambiguous rank-to-device mapping.
+    # torchrun assigns one independent scientific replica to each allocated GPU.
+    # No collectives are used: NCCL is unstable on this cluster/image pairing.
+    rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    dist.init_process_group("nccl", device_id=device)
-    rank, world = dist.get_rank(), dist.get_world_size()
-    seed = int(cfg["seed"])
-    random.seed(seed + rank); np.random.seed(seed + rank); torch.manual_seed(seed)
+    seed = int(cfg["seed"]) + rank
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     start_time = time.time()
     start_utc = utc_now()
 
@@ -406,12 +398,26 @@ def main() -> None:
         train_paths.append(cache / f"raw.{index:04d}.npy")
     val_path = cache / "raw.0100.npy"
     sft_path, rl_path = cache / "sft.json", cache / "rl.parquet"
+    ready = cache / f"ready-{int(cfg['pretrain_shards'])}"
+    failed = cache / f"failed-{int(cfg['pretrain_shards'])}"
     if rank == 0:
-        for index, path in enumerate(train_paths):
-            download(f"{PRETRAIN_REPO}/shard_0000/raw.{index:04d}.npy?download=true", path)
-        download(f"{PRETRAIN_REPO}/shard_0000/raw.0100.npy?download=true", val_path)
-        download(SFT_URL, sft_path); download(RL_URL, rl_path)
-    dist.barrier()
+        try:
+            for index, path in enumerate(train_paths):
+                download(f"{PRETRAIN_REPO}/shard_0000/raw.{index:04d}.npy?download=true", path)
+            download(f"{PRETRAIN_REPO}/shard_0000/raw.0100.npy?download=true", val_path)
+            download(SFT_URL, sft_path); download(RL_URL, rl_path)
+            ready.touch()
+        except Exception as exc:
+            failed.write_text(repr(exc))
+            raise
+    else:
+        deadline = time.time() + 1800
+        while not ready.exists():
+            if failed.exists():
+                raise RuntimeError(f"rank-0 download failed: {failed.read_text()}")
+            if time.time() > deadline:
+                raise TimeoutError("timed out waiting for rank-0 public-data download")
+            time.sleep(1)
 
     train_data = np.concatenate([np.load(path) for path in train_paths])
     val_data = np.load(val_path)
@@ -420,39 +426,37 @@ def main() -> None:
 
     model = ChessLM().to(device)
     parameter_count = sum(p.numel() for p in model.parameters())
-    model = DDP(model, device_ids=[local_rank], broadcast_buffers=False)
     if rank == 0:
         print("RUN_START_UTC", start_utc, flush=True)
         print("CONFIG_JSON", json.dumps(cfg, sort_keys=True), flush=True)
         print("DATA_SOURCES", json.dumps({"pretrain": "chess-pre-to-post/pretrain_v1_20b (2022 Lichess)", "sft": "chess-pre-to-post/sft_v1_200m_90k", "rl": "chess-pre-to-post/chess-rl-data-balanced"}), flush=True)
         print("MODEL", json.dumps({"parameters": parameter_count, "layers": 6, "width": 512, "intermediate": 1536, "heads": 4, "vocab": len(VOCAB), "context": cfg["sequence_length"]}), flush=True)
-        print("COMPUTE", json.dumps({"backend": "kubernetes", "gpu_model": torch.cuda.get_device_name(0), "gpu_count": world}), flush=True)
+        print("COMPUTE", json.dumps({"backend": "kubernetes", "gpu_model": torch.cuda.get_device_name(0), "allocated_gpu_count": world, "replica_gpu_count": 1}), flush=True)
         print("SPLIT", json.dumps({"sft_examples": len(sft_examples), "rl_train": len(rl_train), "eval": len(rl_eval), "eval_rule": "sha256 bucket < 2000; disjoint IDs; one-solver-move puzzles"}), flush=True)
 
     # One epoch over a nested prefix of official token shards.
     seq, batch_size = int(cfg["sequence_length"]), int(cfg["pretrain_batch_per_gpu"])
     nseq = (len(train_data) - 1) // seq
-    local_indices = np.arange(rank, nseq, world)
+    indices = np.arange(nseq)
     rng = np.random.default_rng(seed)
-    rng.shuffle(local_indices)
-    pre_steps = len(local_indices) // batch_size
+    rng.shuffle(indices)
+    pre_steps = len(indices) // batch_size
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["pretrain_lr"]), betas=(0.9, 0.95), weight_decay=0.1)
     model.train()
     for step in range(pre_steps):
         lr = cosine_lr(step, pre_steps, float(cfg["pretrain_lr"]), 1e-4)
         for group in optimizer.param_groups: group["lr"] = lr
-        chosen = local_indices[step * batch_size : (step + 1) * batch_size]
+        chosen = indices[step * batch_size : (step + 1) * batch_size]
         x = torch.tensor(np.stack([train_data[i * seq : i * seq + seq] for i in chosen]), dtype=torch.long, device=device)
         y = torch.tensor(np.stack([train_data[i * seq + 1 : i * seq + seq + 1] for i in chosen]), dtype=torch.long, device=device)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss = F.cross_entropy(model(x).flatten(0, 1), y.flatten())
         loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
-        if rank == 0 and (step % 50 == 0 or step + 1 == pre_steps):
-            print(f"PRETRAIN step={step+1} total={pre_steps} loss={float(loss):.6f} lr={lr:.8g}", flush=True)
-    pretrain_val = validate_lm(model, val_data, device, rank, world, seq)
-    if rank == 0:
-        print(f"PRETRAIN_FINAL tokens={len(train_data)} steps={pre_steps} val_loss={pretrain_val:.8f}", flush=True)
+        if step % 50 == 0 or step + 1 == pre_steps:
+            print(f"REPLICA rank={rank} PRETRAIN step={step+1} total={pre_steps} loss={float(loss):.6f} lr={lr:.8g}", flush=True)
+    pretrain_val = validate_lm(model, val_data, device, seq)
+    print(f"REPLICA rank={rank} PRETRAIN_FINAL tokens={len(train_data)} steps={pre_steps} val_loss={pretrain_val:.8f}", flush=True)
 
     # Matched Stockfish-verified trace SFT.
     sft_steps, sft_batch = int(cfg["sft_steps"]), int(cfg["sft_batch_per_gpu"])
@@ -460,35 +464,35 @@ def main() -> None:
     for step in range(sft_steps):
         lr = cosine_lr(step, sft_steps, float(cfg["sft_lr"]), 1e-5, 0.01)
         for group in optimizer.param_groups: group["lr"] = lr
-        rr = random.Random(seed + rank * 100_000 + step)
+        rr = random.Random(seed * 100_000 + step)
         batch = [sft_examples[rr.randrange(len(sft_examples))] for _ in range(sft_batch)]
         x, y = pad_supervised(batch, device)
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss = F.cross_entropy(model(x).flatten(0, 1), y.flatten(), ignore_index=-100)
         loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
-        if rank == 0 and (step % 20 == 0 or step + 1 == sft_steps):
-            print(f"SFT step={step+1} total={sft_steps} loss={float(loss):.6f} lr={lr:.8g}", flush=True)
+        if step % 20 == 0 or step + 1 == sft_steps:
+            print(f"REPLICA rank={rank} SFT step={step+1} total={sft_steps} loss={float(loss):.6f} lr={lr:.8g}", flush=True)
 
     # Frozen SFT reference and matched GRPO.
     reference = ChessLM().to(device)
-    reference.load_state_dict(model.module.state_dict()); reference.eval()
+    reference.load_state_dict(model.state_dict()); reference.eval()
     for parameter in reference.parameters(): parameter.requires_grad_(False)
     rl_steps = int(cfg["rl_steps"])
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["rl_lr"]), betas=(0.9, 0.95), weight_decay=0.0)
     eval_updates = set(map(int, cfg["eval_updates"]))
     trajectory = []
     if 0 in eval_updates:
-        score, count = evaluate_pass1(model, rl_eval, device, rank, world)
+        score, count = evaluate_pass1(model, rl_eval, device)
         trajectory.append({"update": 0, "pass_at_1": score, "n": count})
-        if rank == 0: print(f"EVAL update=0 pass_at_1={score:.8f} n={count}", flush=True)
+        print(f"REPLICA rank={rank} EVAL update=0 pass_at_1={score:.8f} n={count}", flush=True)
 
     prompts_per_rank = int(cfg["rl_prompts_per_gpu"])
     group_size = int(cfg["rl_group_size"])
     clip_eps, kl_beta = float(cfg["rl_clip_ratio"]), float(cfg["rl_kl_beta"])
     for step in range(1, rl_steps + 1):
-        batch = [rl_train[(step * world * prompts_per_rank + rank * prompts_per_rank + j) % len(rl_train)] for j in range(prompts_per_rank)]
-        module = model.module
+        batch = [rl_train[(step * prompts_per_rank + j) % len(rl_train)] for j in range(prompts_per_rank)]
+        module = model
         module.eval()
         contexts, move_names, actions = reasoning_contexts(module, batch, device)
         module.train()
@@ -512,32 +516,30 @@ def main() -> None:
             rl_loss = torch.stack(losses).mean()
         rl_loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
         reward_tensor = torch.stack(rewards_seen).mean().detach()
-        dist.all_reduce(reward_tensor); reward_tensor /= world
-        if rank == 0 and (step % 5 == 0 or step == 1):
-            print(f"GRPO update={step} loss={float(rl_loss):.8f} sampled_reward={float(reward_tensor):.8f}", flush=True)
+        if step % 5 == 0 or step == 1:
+            print(f"REPLICA rank={rank} GRPO update={step} loss={float(rl_loss):.8f} sampled_reward={float(reward_tensor):.8f}", flush=True)
         if step in eval_updates:
-            score, count = evaluate_pass1(model, rl_eval, device, rank, world)
+            score, count = evaluate_pass1(model, rl_eval, device)
             trajectory.append({"update": step, "pass_at_1": score, "n": count})
-            if rank == 0: print(f"EVAL update={step} pass_at_1={score:.8f} n={count}", flush=True)
+            print(f"REPLICA rank={rank} EVAL update={step} pass_at_1={score:.8f} n={count}", flush=True)
 
     end_utc, elapsed = utc_now(), time.time() - start_time
-    if rank == 0:
-        xs = np.log10(np.array([max(point["update"], 1) for point in trajectory], dtype=float))
-        ys = np.array([point["pass_at_1"] for point in trajectory], dtype=float)
-        fit_mask = np.array([point["update"] > 0 for point in trajectory])
-        slope = float(np.polyfit(xs[fit_mask], ys[fit_mask], 1)[0]) if fit_mask.sum() >= 2 else float("nan")
-        result = {
-            "arm": cfg["arm"], "pretraining_tokens": int(len(train_data)), "pretraining_steps": pre_steps,
-            "pretraining_validation_loss": pretrain_val, "sft_steps": sft_steps, "rl_steps": rl_steps,
-            "trajectory": trajectory, "rl_slope_per_log10_update": slope,
-            "final_pass_at_1": trajectory[-1]["pass_at_1"], "eval_puzzles": len(rl_eval),
-            "backend": "kubernetes", "gpu_model": torch.cuda.get_device_name(0), "gpu_count": world,
-            "start_utc": start_utc, "end_utc": end_utc, "elapsed_seconds": elapsed,
-        }
-        print("RESULT_JSON", json.dumps(result, sort_keys=True), flush=True)
-        print("RUN_END_UTC", end_utc, flush=True)
-        print(f"ELAPSED_SECONDS {elapsed:.3f}", flush=True)
-    dist.destroy_process_group()
+    xs = np.log10(np.array([max(point["update"], 1) for point in trajectory], dtype=float))
+    ys = np.array([point["pass_at_1"] for point in trajectory], dtype=float)
+    fit_mask = np.array([point["update"] > 0 for point in trajectory])
+    slope = float(np.polyfit(xs[fit_mask], ys[fit_mask], 1)[0]) if fit_mask.sum() >= 2 else float("nan")
+    result = {
+        "arm": cfg["arm"], "replica": rank, "seed": seed,
+        "pretraining_tokens": int(len(train_data)), "pretraining_steps": pre_steps,
+        "pretraining_validation_loss": pretrain_val, "sft_steps": sft_steps, "rl_steps": rl_steps,
+        "trajectory": trajectory, "rl_slope_per_log10_update": slope,
+        "final_pass_at_1": trajectory[-1]["pass_at_1"], "eval_puzzles": len(rl_eval),
+        "backend": "kubernetes", "gpu_model": torch.cuda.get_device_name(0),
+        "allocated_gpu_count": world, "replica_gpu_count": 1,
+        "start_utc": start_utc, "end_utc": end_utc, "elapsed_seconds": elapsed,
+    }
+    print("RESULT_JSON", json.dumps(result, sort_keys=True), flush=True)
+    print(f"REPLICA rank={rank} RUN_END_UTC {end_utc} ELAPSED_SECONDS {elapsed:.3f}", flush=True)
 
 
 if __name__ == "__main__":
