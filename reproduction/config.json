@@ -1,6 +1,6 @@
 {
-  "arm": "scout",
-  "seed": 20260720,
+  "arm": "scout-repeat",
+  "seed": 20260728,
   "pretrain_shards": 1,
   "sequence_length": 256,
   "pretrain_batch_per_gpu": 16,
