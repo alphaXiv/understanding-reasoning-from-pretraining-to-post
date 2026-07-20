@@ -32,7 +32,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 FILES, RANKS = "abcdefgh", "12345678"
@@ -145,7 +144,8 @@ def apply_rope(x: torch.Tensor) -> torch.Tensor:
     positions = torch.arange(t, device=x.device, dtype=torch.float32)
     inv = 1.0 / (10_000 ** (torch.arange(0, d, 2, device=x.device, dtype=torch.float32) / d))
     angles = torch.outer(positions, inv)
-    cos, sin = angles.cos()[None, None], angles.sin()[None, None]
+    cos = angles.cos()[None, None].to(dtype=x.dtype)
+    sin = angles.sin()[None, None].to(dtype=x.dtype)
     even, odd = x[..., 0::2], x[..., 1::2]
     return torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1).flatten(-2)
 
@@ -205,7 +205,8 @@ def normalized_fen(board: chess.Board) -> str:
 
 def load_puzzles(path: Path, sft_positions: set[str], train_n: int, eval_n: int) -> tuple[list[Puzzle], list[Puzzle]]:
     frame = pd.read_parquet(path)
-    records: list[Puzzle] = []
+    train_set: list[Puzzle] = []
+    eval_set: list[Puzzle] = []
     for row in frame.itertuples(index=False):
         info, reward = row.extra_info, row.reward_model
         puzzle_id = str(info.get("PuzzleId", ""))
@@ -214,6 +215,10 @@ def load_puzzles(path: Path, sft_positions: set[str], train_n: int, eval_n: int)
         try:
             truth = ast.literal_eval(str(reward.get("ground_truth")))
             board = chess.Board(str(info["FEN"]))
+            environment_move = chess.Move.from_uci(str(info["first_move_uci"]))
+            if environment_move not in board.legal_moves:
+                continue
+            board.push(environment_move)
             target = str(truth[0])
             move = chess.Move.from_uci(target)
         except Exception:
@@ -227,11 +232,13 @@ def load_puzzles(path: Path, sft_positions: set[str], train_n: int, eval_n: int)
         prompt_toks, _ = pgn_tokens(prompt_text)
         if len(prompt_toks) < 6:
             continue
-        records.append(Puzzle(puzzle_id, [BOS] + ids(prompt_toks), board, target, rating))
-    records.sort(key=lambda p: (stable_bucket(p.puzzle_id), p.puzzle_id))
-    eval_set = [p for p in records if stable_bucket(p.puzzle_id) < 2000][:eval_n]
-    eval_ids = {p.puzzle_id for p in eval_set}
-    train_set = [p for p in records if p.puzzle_id not in eval_ids][:train_n]
+        puzzle = Puzzle(puzzle_id, [BOS] + ids(prompt_toks), board, target, rating)
+        if stable_bucket(puzzle_id) < 2000 and len(eval_set) < eval_n:
+            eval_set.append(puzzle)
+        elif stable_bucket(puzzle_id) >= 2000 and len(train_set) < train_n:
+            train_set.append(puzzle)
+        if len(train_set) == train_n and len(eval_set) == eval_n:
+            break
     if len(train_set) < train_n or len(eval_set) < eval_n:
         raise RuntimeError(f"insufficient puzzles: train={len(train_set)} eval={len(eval_set)}")
     return train_set, eval_set
@@ -285,19 +292,18 @@ def cosine_lr(step: int, total: int, peak: float, minimum: float, warmup_ratio: 
     return minimum + 0.5 * (peak - minimum) * (1 + math.cos(math.pi * progress))
 
 
-def validate_lm(model: nn.Module, data: np.ndarray, device: torch.device, rank: int, world: int, seq: int) -> float:
-    module = model.module if isinstance(model, DDP) else model
+def validate_lm(model: nn.Module, data: np.ndarray, device: torch.device, seq: int) -> float:
+    module = model
     module.eval()
     losses = torch.zeros(2, device=device)
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        starts = list(range(rank * seq, min(len(data) - seq - 1, 256 * seq * world), seq * world))
+        starts = list(range(0, min(len(data) - seq - 1, 256 * seq), seq))
         for offset in range(0, len(starts), 16):
             chunk = starts[offset : offset + 16]
             x = torch.tensor(np.stack([data[s : s + seq] for s in chunk]), dtype=torch.long, device=device)
             y = torch.tensor(np.stack([data[s + 1 : s + seq + 1] for s in chunk]), dtype=torch.long, device=device)
             loss = F.cross_entropy(module(x).flatten(0, 1), y.flatten())
             losses += torch.tensor([float(loss) * len(chunk), len(chunk)], device=device)
-    dist.all_reduce(losses)
     module.train()
     return float((losses[0] / losses[1]).item())
 
@@ -355,9 +361,9 @@ def reasoning_contexts(module: nn.Module, puzzles: list[Puzzle], device: torch.d
     return contexts, ucis, actions
 
 
-def evaluate_pass1(model: nn.Module, puzzles: list[Puzzle], device: torch.device, rank: int, world: int) -> tuple[float, int]:
-    module = model.module if isinstance(model, DDP) else model
-    local = puzzles[rank::world]
+def evaluate_pass1(model: nn.Module, puzzles: list[Puzzle], device: torch.device) -> tuple[float, int]:
+    module = model
+    local = puzzles
     counts = torch.zeros(2, device=device)
     module.eval()
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
@@ -368,7 +374,6 @@ def evaluate_pass1(model: nn.Module, puzzles: list[Puzzle], device: torch.device
             for puzzle, moves, move_scores in zip(batch, ucis, scores):
                 counts[0] += float(moves[int(move_scores.argmax())] == puzzle.target)
                 counts[1] += 1
-    dist.all_reduce(counts)
     module.train()
     return float((counts[0] / counts[1]).item()), int(counts[1].item())
 
@@ -378,12 +383,16 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     args = parser.parse_args()
     cfg = json.loads(Path(args.config).read_text())
-    dist.init_process_group("nccl")
-    rank, world, local_rank = dist.get_rank(), dist.get_world_size(), int(os.environ["LOCAL_RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    seed = int(cfg["seed"])
-    random.seed(seed + rank); np.random.seed(seed + rank); torch.manual_seed(seed)
+    # Gloo is used only as a CPU barrier for shared downloads. Each GPU trains an
+    # independent seed; this avoids the cluster's reproducible NCCL collective
+    # crash while turning an 8-GPU arm into eight paired scientific replicates.
+    dist.init_process_group("gloo")
+    rank, world = dist.get_rank(), dist.get_world_size()
+    seed = int(cfg["seed"]) + rank
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     start_time = time.time()
     start_utc = utc_now()
 
@@ -407,19 +416,18 @@ def main() -> None:
 
     model = ChessLM().to(device)
     parameter_count = sum(p.numel() for p in model.parameters())
-    model = DDP(model, device_ids=[local_rank], broadcast_buffers=False)
+    print(f"REPLICATE rank={rank} seed={seed} RUN_START_UTC {start_utc}", flush=True)
+    print(f"REPLICATE rank={rank} CONFIG_JSON {json.dumps(cfg, sort_keys=True)}", flush=True)
     if rank == 0:
-        print("RUN_START_UTC", start_utc, flush=True)
-        print("CONFIG_JSON", json.dumps(cfg, sort_keys=True), flush=True)
         print("DATA_SOURCES", json.dumps({"pretrain": "chess-pre-to-post/pretrain_v1_20b (2022 Lichess)", "sft": "chess-pre-to-post/sft_v1_200m_90k", "rl": "chess-pre-to-post/chess-rl-data-balanced"}), flush=True)
         print("MODEL", json.dumps({"parameters": parameter_count, "layers": 6, "width": 512, "intermediate": 1536, "heads": 4, "vocab": len(VOCAB), "context": cfg["sequence_length"]}), flush=True)
-        print("COMPUTE", json.dumps({"backend": "kubernetes", "gpu_model": torch.cuda.get_device_name(0), "gpu_count": world}), flush=True)
+        print("COMPUTE", json.dumps({"backend": "kubernetes", "gpu_model": torch.cuda.get_device_name(0), "allocated_gpu_count": world, "independent_replicates": world}), flush=True)
         print("SPLIT", json.dumps({"sft_examples": len(sft_examples), "rl_train": len(rl_train), "eval": len(rl_eval), "eval_rule": "sha256 bucket < 2000; disjoint IDs; one-solver-move puzzles"}), flush=True)
 
     # One epoch over a nested prefix of official token shards.
     seq, batch_size = int(cfg["sequence_length"]), int(cfg["pretrain_batch_per_gpu"])
     nseq = (len(train_data) - 1) // seq
-    local_indices = np.arange(rank, nseq, world)
+    local_indices = np.arange(nseq)
     rng = np.random.default_rng(seed)
     rng.shuffle(local_indices)
     pre_steps = len(local_indices) // batch_size
@@ -435,11 +443,10 @@ def main() -> None:
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss = F.cross_entropy(model(x).flatten(0, 1), y.flatten())
         loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
-        if rank == 0 and (step % 50 == 0 or step + 1 == pre_steps):
-            print(f"PRETRAIN step={step+1} total={pre_steps} loss={float(loss):.6f} lr={lr:.8g}", flush=True)
-    pretrain_val = validate_lm(model, val_data, device, rank, world, seq)
-    if rank == 0:
-        print(f"PRETRAIN_FINAL tokens={len(train_data)} steps={pre_steps} val_loss={pretrain_val:.8f}", flush=True)
+        if step % 50 == 0 or step + 1 == pre_steps:
+            print(f"REPLICATE rank={rank} PRETRAIN step={step+1} total={pre_steps} loss={float(loss):.6f} lr={lr:.8g}", flush=True)
+    pretrain_val = validate_lm(model, val_data, device, seq)
+    print(f"REPLICATE rank={rank} PRETRAIN_FINAL tokens={len(train_data)} steps={pre_steps} val_loss={pretrain_val:.8f}", flush=True)
 
     # Matched Stockfish-verified trace SFT.
     sft_steps, sft_batch = int(cfg["sft_steps"]), int(cfg["sft_batch_per_gpu"])
@@ -454,28 +461,28 @@ def main() -> None:
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss = F.cross_entropy(model(x).flatten(0, 1), y.flatten(), ignore_index=-100)
         loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
-        if rank == 0 and (step % 20 == 0 or step + 1 == sft_steps):
-            print(f"SFT step={step+1} total={sft_steps} loss={float(loss):.6f} lr={lr:.8g}", flush=True)
+        if step % 20 == 0 or step + 1 == sft_steps:
+            print(f"REPLICATE rank={rank} SFT step={step+1} total={sft_steps} loss={float(loss):.6f} lr={lr:.8g}", flush=True)
 
     # Frozen SFT reference and matched GRPO.
     reference = ChessLM().to(device)
-    reference.load_state_dict(model.module.state_dict()); reference.eval()
+    reference.load_state_dict(model.state_dict()); reference.eval()
     for parameter in reference.parameters(): parameter.requires_grad_(False)
     rl_steps = int(cfg["rl_steps"])
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["rl_lr"]), betas=(0.9, 0.95), weight_decay=0.0)
     eval_updates = set(map(int, cfg["eval_updates"]))
     trajectory = []
     if 0 in eval_updates:
-        score, count = evaluate_pass1(model, rl_eval, device, rank, world)
+        score, count = evaluate_pass1(model, rl_eval, device)
         trajectory.append({"update": 0, "pass_at_1": score, "n": count})
-        if rank == 0: print(f"EVAL update=0 pass_at_1={score:.8f} n={count}", flush=True)
+        print(f"REPLICATE rank={rank} EVAL update=0 pass_at_1={score:.8f} n={count}", flush=True)
 
     prompts_per_rank = int(cfg["rl_prompts_per_gpu"])
     group_size = int(cfg["rl_group_size"])
     clip_eps, kl_beta = float(cfg["rl_clip_ratio"]), float(cfg["rl_kl_beta"])
     for step in range(1, rl_steps + 1):
         batch = [rl_train[(step * world * prompts_per_rank + rank * prompts_per_rank + j) % len(rl_train)] for j in range(prompts_per_rank)]
-        module = model.module
+        module = model
         module.eval()
         contexts, move_names, actions = reasoning_contexts(module, batch, device)
         module.train()
@@ -499,31 +506,30 @@ def main() -> None:
             rl_loss = torch.stack(losses).mean()
         rl_loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); optimizer.step()
         reward_tensor = torch.stack(rewards_seen).mean().detach()
-        dist.all_reduce(reward_tensor); reward_tensor /= world
-        if rank == 0 and (step % 5 == 0 or step == 1):
-            print(f"GRPO update={step} loss={float(rl_loss):.8f} sampled_reward={float(reward_tensor):.8f}", flush=True)
+        if step % 5 == 0 or step == 1:
+            print(f"REPLICATE rank={rank} GRPO update={step} loss={float(rl_loss):.8f} sampled_reward={float(reward_tensor):.8f}", flush=True)
         if step in eval_updates:
-            score, count = evaluate_pass1(model, rl_eval, device, rank, world)
+            score, count = evaluate_pass1(model, rl_eval, device)
             trajectory.append({"update": step, "pass_at_1": score, "n": count})
-            if rank == 0: print(f"EVAL update={step} pass_at_1={score:.8f} n={count}", flush=True)
+            print(f"REPLICATE rank={rank} EVAL update={step} pass_at_1={score:.8f} n={count}", flush=True)
 
     end_utc, elapsed = utc_now(), time.time() - start_time
-    if rank == 0:
-        xs = np.log10(np.array([max(point["update"], 1) for point in trajectory], dtype=float))
-        ys = np.array([point["pass_at_1"] for point in trajectory], dtype=float)
-        fit_mask = np.array([point["update"] > 0 for point in trajectory])
-        slope = float(np.polyfit(xs[fit_mask], ys[fit_mask], 1)[0]) if fit_mask.sum() >= 2 else float("nan")
-        result = {
-            "arm": cfg["arm"], "pretraining_tokens": int(len(train_data)), "pretraining_steps": pre_steps,
-            "pretraining_validation_loss": pretrain_val, "sft_steps": sft_steps, "rl_steps": rl_steps,
-            "trajectory": trajectory, "rl_slope_per_log10_update": slope,
-            "final_pass_at_1": trajectory[-1]["pass_at_1"], "eval_puzzles": len(rl_eval),
-            "backend": "kubernetes", "gpu_model": torch.cuda.get_device_name(0), "gpu_count": world,
-            "start_utc": start_utc, "end_utc": end_utc, "elapsed_seconds": elapsed,
-        }
-        print("RESULT_JSON", json.dumps(result, sort_keys=True), flush=True)
-        print("RUN_END_UTC", end_utc, flush=True)
-        print(f"ELAPSED_SECONDS {elapsed:.3f}", flush=True)
+    xs = np.log10(np.array([max(point["update"], 1) for point in trajectory], dtype=float))
+    ys = np.array([point["pass_at_1"] for point in trajectory], dtype=float)
+    fit_mask = np.array([point["update"] > 0 for point in trajectory])
+    slope = float(np.polyfit(xs[fit_mask], ys[fit_mask], 1)[0]) if fit_mask.sum() >= 2 else float("nan")
+    result = {
+        "arm": cfg["arm"], "replicate_rank": rank, "seed": seed,
+        "pretraining_tokens": int(len(train_data)), "pretraining_steps": pre_steps,
+        "pretraining_validation_loss": pretrain_val, "sft_steps": sft_steps, "rl_steps": rl_steps,
+        "trajectory": trajectory, "rl_slope_per_log10_update": slope,
+        "final_pass_at_1": trajectory[-1]["pass_at_1"], "eval_puzzles": len(rl_eval),
+        "backend": "kubernetes", "gpu_model": torch.cuda.get_device_name(0), "gpu_count": 1,
+        "allocated_gpu_count": world, "start_utc": start_utc, "end_utc": end_utc,
+        "elapsed_seconds": elapsed,
+    }
+    print("RESULT_JSON", json.dumps(result, sort_keys=True), flush=True)
+    print(f"REPLICATE rank={rank} RUN_END_UTC {end_utc} ELAPSED_SECONDS {elapsed:.3f}", flush=True)
     dist.destroy_process_group()
 
 
