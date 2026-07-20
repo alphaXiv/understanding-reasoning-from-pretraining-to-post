@@ -1,7 +1,7 @@
 {
-  "arm": "scout-replicate",
+  "arm": "scout-two-shards",
   "seed": 20260721,
-  "pretrain_shards": 1,
+  "pretrain_shards": 2,
   "sequence_length": 256,
   "pretrain_batch_per_gpu": 16,
   "pretrain_lr": 0.001,
