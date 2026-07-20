@@ -145,7 +145,10 @@ def apply_rope(x: torch.Tensor) -> torch.Tensor:
     positions = torch.arange(t, device=x.device, dtype=torch.float32)
     inv = 1.0 / (10_000 ** (torch.arange(0, d, 2, device=x.device, dtype=torch.float32) / d))
     angles = torch.outer(positions, inv)
-    cos, sin = angles.cos()[None, None], angles.sin()[None, None]
+    # Keep attention operands in one dtype under BF16 autocast.  Promoting q/k
+    # to FP32 while v remains BF16 can enter unsupported fused-SDPA paths.
+    cos = angles.cos()[None, None].to(dtype=x.dtype)
+    sin = angles.sin()[None, None].to(dtype=x.dtype)
     even, odd = x[..., 0::2], x[..., 1::2]
     return torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1).flatten(-2)
 
@@ -385,10 +388,13 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     args = parser.parse_args()
     cfg = json.loads(Path(args.config).read_text())
-    dist.init_process_group("nccl")
-    rank, world, local_rank = dist.get_rank(), dist.get_world_size(), int(os.environ["LOCAL_RANK"])
+    # Bind each process before NCCL creates communicators.  This is required on
+    # the 8-GPU Kubernetes pods and removes ambiguous rank-to-device mapping.
+    local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
+    dist.init_process_group("nccl", device_id=device)
+    rank, world = dist.get_rank(), dist.get_world_size()
     seed = int(cfg["seed"])
     random.seed(seed + rank); np.random.seed(seed + rank); torch.manual_seed(seed)
     start_time = time.time()
